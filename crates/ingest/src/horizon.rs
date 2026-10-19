@@ -1,7 +1,9 @@
 //! Horizon payments client for the ingest worker.
 //!
-//! Polls an account's `/payments` endpoint (with `join=transactions` so we get the memo) using a
-//! saved paging-token cursor. Cursor polling keeps the worker simple, restart-safe, and trivially
+//! Polls an account's `/operations` endpoint (with `join=transactions` so we get the memo) using a
+//! saved paging-token cursor. `/operations` rather than `/payments` because only it carries
+//! `claim_claimable_balance` (issue #448); paging tokens are the same operation TOIDs in both, so
+//! cursors stored before the switch remain valid. Cursor polling keeps the worker simple, restart-safe, and trivially
 //! horizontally scalable (one worker per account); the cursor is the durable resume point.
 //!
 //! Wallets opted into streaming (issue #446) additionally hold an SSE connection via
@@ -42,14 +44,17 @@ pub struct PaymentRecord {
     pub id: String,
     /// Cursor token for resuming after this record.
     pub paging_token: String,
-    /// `"payment"` or `"create_account"` etc. We only credit `payment` (and createAccount).
+    /// Horizon operation type; only the crediting types in `lib.rs` are ever recorded.
     #[serde(rename = "type")]
     pub kind: String,
+    #[serde(default)]
     pub transaction_hash: Option<String>,
     #[serde(default)]
     pub transaction_successful: bool,
+    #[serde(default)]
     pub from: Option<String>,
     /// Destination base account (`G...`).
+    #[serde(default)]
     pub to: Option<String>,
     /// Present when the payment was sent to a muxed (`M...`) address.
     #[serde(default)]
@@ -57,12 +62,14 @@ pub struct PaymentRecord {
     /// The muxed id (customer id) when `to_muxed` is set. Horizon returns it as a string.
     #[serde(default)]
     pub to_muxed_id: Option<String>,
+    #[serde(default)]
     pub asset_type: Option<String>,
     #[serde(default)]
     pub asset_code: Option<String>,
     #[serde(default)]
     pub asset_issuer: Option<String>,
     /// Decimal amount string, e.g. "10.0000000".
+    #[serde(default)]
     pub amount: Option<String>,
     /// createAccount uses `starting_balance` instead of `amount`.
     #[serde(default)]
@@ -70,6 +77,12 @@ pub struct PaymentRecord {
     /// Joined parent transaction (for memo + ledger).
     #[serde(default)]
     pub transaction: Option<TransactionRecord>,
+    /// `claim_claimable_balance` only: the claimed balance's id (hex).
+    #[serde(default)]
+    pub balance_id: Option<String>,
+    /// `claim_claimable_balance` only: the account that claimed, and so received, the funds.
+    #[serde(default)]
+    pub claimant: Option<String>,
 }
 
 /// The joined transaction fields we use.
@@ -86,13 +99,50 @@ pub struct TransactionRecord {
 }
 
 #[derive(Debug, Deserialize)]
-struct Embedded {
-    records: Vec<PaymentRecord>,
+struct Embedded<T> {
+    records: Vec<T>,
 }
 
 #[derive(Debug, Deserialize)]
-struct PaymentsPage {
-    _embedded: Embedded,
+struct Page<T> {
+    _embedded: Embedded<T>,
+}
+
+/// The fields of an operation effect used to read what a claim actually credited.
+#[derive(Debug, Deserialize)]
+struct EffectRecord {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    amount: Option<String>,
+    #[serde(default)]
+    asset_type: Option<String>,
+    #[serde(default)]
+    asset_code: Option<String>,
+    #[serde(default)]
+    asset_issuer: Option<String>,
+}
+
+/// What a `claim_claimable_balance` operation credited to the claimant (its `account_credited` effect).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimCredit {
+    pub amount: String,
+    pub asset_type: Option<String>,
+    pub asset_code: Option<String>,
+    pub asset_issuer: Option<String>,
+}
+
+/// Who created a claimable balance, and the memo of the transaction that created it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClaimOrigin {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub source_account: Option<String>,
+    #[serde(default)]
+    pub transaction: Option<TransactionRecord>,
 }
 
 /// A thin Horizon payments client with retry-with-backoff and circuit-breaker protection.
@@ -131,7 +181,7 @@ impl HorizonPayments {
         }
     }
 
-    /// Fetch up to `limit` payments for `account_g`, oldest-first, starting after `cursor`.
+    /// Fetch up to `limit` operations for `account_g`, oldest-first, starting after `cursor`.
     ///
     /// Oldest-first (`order=asc`) so we process and advance the cursor monotonically. Transient
     /// failures are retried with exponential backoff; the circuit breaker opens after repeated
@@ -155,7 +205,7 @@ impl HorizonPayments {
     ) -> Result<Vec<PaymentRecord>, HorizonError> {
         let span = tracing::Span::current();
         let mut url = format!(
-            "{}/accounts/{}/payments?order=asc&limit={}&join=transactions",
+            "{}/accounts/{}/operations?order=asc&limit={}&join=transactions",
             self.base_url.trim_end_matches('/'),
             account_g,
             limit
@@ -165,32 +215,7 @@ impl HorizonPayments {
             url.push_str(c);
         }
 
-        let http = self.http.clone();
-        let result = execute(&self.circuit, &self.retry, CallKind::ReadOnly, || {
-            let url = url.clone();
-            let http = http.clone();
-            async move {
-                let resp = http
-                    .get(&url)
-                    .send()
-                    .await
-                    .map_err(|_| IngestFetchError::Transport)?;
-
-                // 404 means the account does not exist on-chain yet — not a retriable error.
-                if resp.status() == reqwest::StatusCode::NOT_FOUND {
-                    return Ok(Vec::new());
-                }
-                if resp.status().is_server_error() {
-                    return Err(IngestFetchError::Transport); // retriable
-                }
-                if !resp.status().is_success() {
-                    return Err(IngestFetchError::Permanent);
-                }
-                let page: PaymentsPage = resp.json().await.map_err(|_| IngestFetchError::Decode)?;
-                Ok(page._embedded.records)
-            }
-        })
-        .await;
+        let result = self.fetch_records::<PaymentRecord>(url).await;
 
         match &result {
             Ok(_) => span.record("outcome", "success"),
@@ -201,15 +226,91 @@ impl HorizonPayments {
             Err(ResilienceError::Exhausted(_)) => span.record("outcome", "failure"),
         };
 
-        match result {
-            Ok(records) => Ok(records),
-            Err(ResilienceError::Circuit) => Err(HorizonError::CircuitOpen),
-            Err(ResilienceError::Exhausted(IngestFetchError::Decode)) => Err(HorizonError::Decode),
-            Err(ResilienceError::Exhausted(_)) => Err(HorizonError::Request),
-        }
+        result.map_err(map_resilience)
     }
 
-    /// Open Horizon's `/payments` SSE stream for `account_g`, resuming after `cursor`.
+    /// What claim operation `op_id` credited to `account_g`, or `None` if it credited nothing to it.
+    pub async fn claim_credit(
+        &self,
+        op_id: &str,
+        account_g: &str,
+    ) -> Result<Option<ClaimCredit>, HorizonError> {
+        let url = format!(
+            "{}/operations/{}/effects?limit=200",
+            self.base_url.trim_end_matches('/'),
+            op_id
+        );
+        let effects = self
+            .fetch_records::<EffectRecord>(url)
+            .await
+            .map_err(map_resilience)?;
+        Ok(effects
+            .into_iter()
+            .find(|e| e.kind == "account_credited" && e.account.as_deref() == Some(account_g))
+            .and_then(|e| {
+                Some(ClaimCredit {
+                    amount: e.amount?,
+                    asset_type: e.asset_type,
+                    asset_code: e.asset_code,
+                    asset_issuer: e.asset_issuer,
+                })
+            }))
+    }
+
+    /// The operation that created claimable balance `balance_id`, or `None` if Horizon has no record.
+    pub async fn claimable_balance_origin(
+        &self,
+        balance_id: &str,
+    ) -> Result<Option<ClaimOrigin>, HorizonError> {
+        let url = format!(
+            "{}/claimable_balances/{}/operations?order=asc&limit=1&join=transactions",
+            self.base_url.trim_end_matches('/'),
+            balance_id
+        );
+        let ops = self
+            .fetch_records::<ClaimOrigin>(url)
+            .await
+            .map_err(map_resilience)?;
+        Ok(ops
+            .into_iter()
+            .next()
+            .filter(|op| op.kind == "create_claimable_balance"))
+    }
+
+    /// GET one Horizon collection page with retry + circuit breaker; a 404 is an empty page.
+    async fn fetch_records<T: serde::de::DeserializeOwned>(
+        &self,
+        url: String,
+    ) -> Result<Vec<T>, ResilienceError<IngestFetchError>> {
+        let http = self.http.clone();
+        execute(&self.circuit, &self.retry, CallKind::ReadOnly, || {
+            let url = url.clone();
+            let http = http.clone();
+            async move {
+                let resp = http
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|_| IngestFetchError::Transport)?;
+
+                // 404 means the resource does not exist on-chain (yet) — not a retriable error.
+                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(Vec::new());
+                }
+                if resp.status().is_server_error() {
+                    return Err(IngestFetchError::Transport); // retriable
+                }
+                if !resp.status().is_success() {
+                    return Err(IngestFetchError::Permanent);
+                }
+                let page: Page<T> = resp.json().await.map_err(|_| IngestFetchError::Decode)?;
+                Ok(page._embedded.records)
+            }
+        })
+        .await
+    }
+
+    /// Open Horizon's `/operations` SSE stream for `account_g`, resuming after `cursor`.
     ///
     /// Gated by the same circuit breaker as [`Self::payments_after`], so an outage stops both
     /// paths. There is no internal retry: the caller owns reconnect backoff (see `stream.rs`).
@@ -221,7 +322,7 @@ impl HorizonPayments {
     ) -> Result<PaymentStream, HorizonError> {
         self.circuit.check().map_err(|_| HorizonError::CircuitOpen)?;
         let url = format!(
-            "{}/accounts/{}/payments",
+            "{}/accounts/{}/operations",
             self.base_url.trim_end_matches('/'),
             account_g
         );
@@ -264,7 +365,7 @@ const STREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Upper bound on one buffered SSE line or event, so a hostile upstream cannot exhaust memory.
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 
-/// An open Horizon `/payments` SSE stream (issue #446).
+/// An open Horizon `/operations` SSE stream (issue #446).
 pub struct PaymentStream {
     resp: reqwest::Response,
     decoder: SseDecoder,
@@ -341,6 +442,15 @@ fn parse_sse_data(data: &str) -> Result<Option<PaymentRecord>, HorizonError> {
     serde_json::from_str(data)
         .map(Some)
         .map_err(|_| HorizonError::Decode)
+}
+
+/// Collapse a resilience outcome into the public error type.
+fn map_resilience(e: ResilienceError<IngestFetchError>) -> HorizonError {
+    match e {
+        ResilienceError::Circuit => HorizonError::CircuitOpen,
+        ResilienceError::Exhausted(IngestFetchError::Decode) => HorizonError::Decode,
+        ResilienceError::Exhausted(_) => HorizonError::Request,
+    }
 }
 
 // ---------------------------------------------------------------------------

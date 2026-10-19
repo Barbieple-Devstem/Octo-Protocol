@@ -1,7 +1,7 @@
 //! Opt-in Horizon SSE ingest per wallet (issue #446).
 //!
 //! A wallet with `ingest_streaming` set gets one long-lived task holding an SSE connection to its
-//! `/payments` stream. Each record goes through the same [`Ingestor::process`] path as polling and
+//! `/operations` stream. Each record goes through the same [`Ingestor::process`] path as polling and
 //! advances the same durable cursor, so a reconnect resumes exactly where it stopped.
 //!
 //! Fallback: while a wallet's stream is open it sits in [`LiveStreams`] and the polling tick skips

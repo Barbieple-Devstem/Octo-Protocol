@@ -76,6 +76,8 @@ fn base_record(id: &str) -> PaymentRecord {
         asset_issuer: None,
         amount: Some("5.0000000".into()),
         starting_balance: None,
+        balance_id: None,
+        claimant: None,
         transaction: None,
     }
 }
@@ -472,6 +474,131 @@ async fn self_path_payment_conversion_is_not_a_deposit() {
     // The master account converting its own XLM into USDC must not look like incoming funds.
     let mut rec = path_payment_record("path_payment_strict_send", None);
     rec.from = Some(BASE.into());
+    assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Skipped);
+    assert!(store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// A `claim_claimable_balance` by our master account of `balance_id`.
+fn claim_record(balance_id: &str) -> PaymentRecord {
+    let (toid, ledger) = unique_toid();
+    serde_json::from_value(serde_json::json!({
+        "id": toid,
+        "paging_token": toid,
+        "type": "claim_claimable_balance",
+        "transaction_successful": true,
+        "transaction_hash": format!("claimhash-{}", Uuid::new_v4().simple()),
+        "source_account": BASE,
+        "balance_id": balance_id,
+        "claimant": BASE,
+        "transaction": { "ledger": ledger },
+    }))
+    .expect("claim fixture")
+}
+
+/// Mount Horizon's claim effects and balance history: `creator` made the balance with `memo_id`.
+async fn mock_claim_horizon(
+    rec: &PaymentRecord,
+    balance_id: &str,
+    creator: &str,
+    memo_id: i64,
+) -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/operations/{}/effects", rec.id)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "_embedded": { "records": [
+                { "type": "claimable_balance_claimed", "balance_id": balance_id,
+                  "asset": format!("USDC:{USDC_TESTNET_ISSUER}"), "amount": "12.0000000" },
+                { "type": "account_credited", "account": BASE, "asset_type": "credit_alphanum4",
+                  "asset_code": "USDC", "asset_issuer": USDC_TESTNET_ISSUER, "amount": "12.0000000" },
+            ]}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/claimable_balances/{balance_id}/operations")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "_embedded": { "records": [{
+                "type": "create_claimable_balance",
+                "source_account": creator,
+                "transaction": { "memo_type": "id", "memo": memo_id.to_string() },
+            }]}
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+fn unique_balance_id() -> String {
+    format!("00000000{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+#[tokio::test]
+async fn claimable_balance_claim_creates_a_single_attributed_deposit() {
+    let Some((store, _, wallet_id)) = setup().await else {
+        return;
+    };
+    let addr = store
+        .allocate_address(
+            wallet_id,
+            |id| encode_muxed(BASE, id as u64).map_err(|_| ()),
+            Some("cust-claim"),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    let balance_id = unique_balance_id();
+    let rec = claim_record(&balance_id);
+    let server = mock_claim_horizon(&rec, &balance_id, "GCREATOR", addr.muxed_id).await;
+    let ingestor = Ingestor::new(store.clone(), &server.uri(), wallet_id, BASE.to_string());
+
+    assert_eq!(
+        ingestor.process(&rec).await.unwrap(),
+        Processed::Recorded { attributed: true }
+    );
+    assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Duplicate);
+
+    let txs = store.list_transactions(wallet_id, 100, None).await.unwrap();
+    assert_eq!(txs.len(), 1, "one claim → one deposit row");
+    assert_eq!(txs[0].address_id, Some(addr.id));
+    assert_eq!(txs[0].amount_stroops, 120_000_000);
+    assert_eq!(txs[0].asset_code, "USDC");
+    assert_eq!(txs[0].source_account.as_deref(), Some("GCREATOR"), "origin is the creator");
+    assert_eq!(txs[0].memo_id, Some(addr.muxed_id));
+}
+
+#[tokio::test]
+async fn reclaiming_our_own_claimable_balance_is_not_a_deposit() {
+    let Some((store, _, wallet_id)) = setup().await else {
+        return;
+    };
+    let balance_id = unique_balance_id();
+    let rec = claim_record(&balance_id);
+    let server = mock_claim_horizon(&rec, &balance_id, BASE, 1).await;
+    let ingestor = Ingestor::new(store.clone(), &server.uri(), wallet_id, BASE.to_string());
+
+    assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Skipped);
+    assert!(store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn claim_by_another_account_is_skipped_without_calling_horizon() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+    // `ingestor` points at an unreachable Horizon, so any lookup here would error, not skip.
+    let mut rec = claim_record(&unique_balance_id());
+    rec.claimant = Some("GSOMEOTHERACCOUNT".into());
     assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Skipped);
     assert!(store
         .list_transactions(wallet_id, 100, None)

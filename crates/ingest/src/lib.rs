@@ -1,6 +1,6 @@
 //! Deposit detection for octo.
 //!
-//! Polls a master account's Horizon `/payments` (oldest-first, from a saved cursor), attributes
+//! Polls a master account's Horizon `/operations` (oldest-first, from a saved cursor), attributes
 //! each incoming payment to a customer by **muxed id** or **transaction memo id**, and records it
 //! idempotently via [`octo_store`]. Unattributable deposits are still recorded but with no
 //! `address_id` (quarantine) — they are never guessed onto a customer.
@@ -201,65 +201,15 @@ impl Ingestor {
         }
     }
 
-    /// Process one payment record into a deposit (or skip it).
+    /// Process one operation record into a deposit (or skip it).
     pub async fn process(&self, rec: &PaymentRecord) -> Result<Processed, IngestError> {
         // 1. Only successful credits to us.
         if !rec.transaction_successful {
             return Ok(Processed::Skipped);
         }
-        if !is_credit_kind(&rec.kind) {
-            return Ok(Processed::Skipped);
-        }
-        // The destination base account must be our master account.
-        match rec.to.as_deref() {
-            Some(to) if to == self.account_g => {}
-            _ => return Ok(Processed::Skipped),
-        }
-        // A path payment from ourselves to ourselves is an asset conversion, not new funds.
-        if is_path_payment(&rec.kind) && rec.from.as_deref() == Some(self.account_g.as_str()) {
-            return Ok(Processed::Skipped);
-        }
 
-        // 2. Amount → stroops, from the field that holds what the destination actually received.
-        let amount_str = credited_amount(rec).unwrap_or("");
-        let Some(stroops) = amount::to_stroops(amount_str) else {
-            // Never credit an approximation: surface the unparseable amount (no customer data).
-            tracing::warn!(
-                op_id = %rec.id,
-                amount = ?amount_str,
-                "skipping payment: amount is not a valid Stellar amount (≤ 7 decimals)"
-            );
-            return Ok(Processed::Skipped);
-        };
-        if stroops <= 0 {
-            return Ok(Processed::Skipped);
-        }
-
-        // 3. Attribute to a customer: muxed id first, then memo id.
-        let customer_id = self.attribute(rec);
-        let address_id = match customer_id {
-            Some(id) => self
-                .store
-                .address_by_muxed_id(self.wallet_id, id)
-                .await?
-                .map(|a| a.id),
-            None => None,
-        };
-        let attributed = address_id.is_some();
-
-        // 4. Asset.
-        let (asset_code, asset_issuer) = match rec.asset_type.as_deref() {
-            Some("native") | None => ("native".to_string(), None),
-            _ => (
-                rec.asset_code.clone().unwrap_or_else(|| "unknown".into()),
-                rec.asset_issuer.clone(),
-            ),
-        };
-
-        let memo_id = self.memo_id(rec);
         let ledger = rec.transaction.as_ref().and_then(|t| t.ledger);
         let tx_hash = rec.transaction_hash.clone().unwrap_or_default();
-
         // A bad TOID would corrupt the (tx_hash, operation_index) dedup key — skip, never guess.
         let toid = decode_toid(&rec.id, plausible_max_ledger())
             .filter(|t| ledger.is_none_or(|l| i64::from(t.ledger) == l));
@@ -273,19 +223,63 @@ impl Ingestor {
             return Ok(Processed::Skipped);
         };
 
+        // 2. What landed in our account, and from whom.
+        let credit = if rec.kind == CLAIM_KIND {
+            self.claim_credit(rec).await?
+        } else {
+            self.direct_credit(rec)
+        };
+        let Some(credit) = credit else {
+            return Ok(Processed::Skipped);
+        };
+
+        // 3. Amount → stroops, from the field that holds what the destination actually received.
+        let Some(stroops) = amount::to_stroops(&credit.amount) else {
+            // Never credit an approximation: surface the unparseable amount (no customer data).
+            tracing::warn!(
+                op_id = %rec.id,
+                amount = ?credit.amount,
+                "skipping payment: amount is not a valid Stellar amount (≤ 7 decimals)"
+            );
+            return Ok(Processed::Skipped);
+        };
+        if stroops <= 0 {
+            return Ok(Processed::Skipped);
+        }
+
+        // 4. Attribute to a customer (muxed id, then memo id; see `Credit::customer_id`).
+        let address_id = match credit.customer_id {
+            Some(id) => self
+                .store
+                .address_by_muxed_id(self.wallet_id, id)
+                .await?
+                .map(|a| a.id),
+            None => None,
+        };
+        let attributed = address_id.is_some();
+
+        // 5. Asset.
+        let (asset_code, asset_issuer) = match credit.asset_type.as_deref() {
+            Some("native") | None => ("native".to_string(), None),
+            _ => (
+                credit.asset_code.unwrap_or_else(|| "unknown".into()),
+                credit.asset_issuer,
+            ),
+        };
+
         let dep = NewDeposit {
             wallet_id: self.wallet_id,
             address_id,
             asset_code,
             asset_issuer,
             amount_stroops: stroops,
-            source_account: rec.from.clone(),
-            destination_account: rec.to_muxed.clone().or_else(|| rec.to.clone()),
+            source_account: credit.source_account,
+            destination_account: credit.destination_account,
             stellar_tx_hash: tx_hash,
             operation_index: toid.operation_index,
             horizon_op_id: rec.id.clone(),
             ledger,
-            memo_id,
+            memo_id: credit.memo_id,
         };
 
         match self.store.record_deposit(&dep).await? {
@@ -296,6 +290,80 @@ impl Ingestor {
             }
             None => Ok(Processed::Duplicate),
         }
+    }
+
+    /// The credit carried directly by a payment, path payment or account creation.
+    fn direct_credit(&self, rec: &PaymentRecord) -> Option<Credit> {
+        if !is_credit_kind(&rec.kind) {
+            return None;
+        }
+        // The destination base account must be our master account.
+        if rec.to.as_deref() != Some(self.account_g.as_str()) {
+            return None;
+        }
+        // A path payment from ourselves to ourselves is an asset conversion, not new funds.
+        if is_path_payment(&rec.kind) && rec.from.as_deref() == Some(self.account_g.as_str()) {
+            return None;
+        }
+        Some(Credit {
+            amount: credited_amount(rec).unwrap_or("").to_string(),
+            asset_type: rec.asset_type.clone(),
+            asset_code: rec.asset_code.clone(),
+            asset_issuer: rec.asset_issuer.clone(),
+            source_account: rec.from.clone(),
+            destination_account: rec.to_muxed.clone().or_else(|| rec.to.clone()),
+            customer_id: self.attribute(rec),
+            memo_id: self.memo_id(rec),
+        })
+    }
+
+    /// The credit from claiming a claimable balance into our account (issue #448).
+    ///
+    /// The amount and asset come from the claim's `account_credited` effect for our account. The
+    /// origin is the balance's creator, and attribution uses the creating transaction's memo id —
+    /// the sender's intent, exactly like the memo fallback — never anything the claimer chose.
+    /// Horizon failures propagate so the cursor holds and the claim is retried, never dropped.
+    async fn claim_credit(&self, rec: &PaymentRecord) -> Result<Option<Credit>, IngestError> {
+        if rec.claimant.as_deref() != Some(self.account_g.as_str()) {
+            return Ok(None);
+        }
+        // The id is interpolated into a URL path, so accept only the hex Horizon issues.
+        let Some(balance_id) = rec.balance_id.as_deref().filter(|b| is_balance_id(b)) else {
+            tracing::warn!(op_id = %rec.id, "claim without a valid balance id; skipping");
+            return Ok(None);
+        };
+        let Some(credited) = self
+            .horizon
+            .claim_credit(&rec.id, &self.account_g)
+            .await
+            .map_err(|_| IngestError::Horizon)?
+        else {
+            return Ok(None);
+        };
+        let origin = self
+            .horizon
+            .claimable_balance_origin(balance_id)
+            .await
+            .map_err(|_| IngestError::Horizon)?;
+        let creator = origin.as_ref().and_then(|o| o.source_account.clone());
+        // Reclaiming a balance we created ourselves returns our own funds; it is not a deposit.
+        if creator.as_deref() == Some(self.account_g.as_str()) {
+            return Ok(None);
+        }
+        let memo_id = origin
+            .as_ref()
+            .and_then(|o| o.transaction.as_ref())
+            .and_then(memo_id_of_tx);
+        Ok(Some(Credit {
+            amount: credited.amount,
+            asset_type: credited.asset_type,
+            asset_code: credited.asset_code,
+            asset_issuer: credited.asset_issuer,
+            source_account: creator,
+            destination_account: rec.claimant.clone(),
+            customer_id: memo_id,
+            memo_id,
+        }))
     }
 
     /// If this deposit landed on a payment link's dedicated address, confirm its oldest pending
@@ -469,12 +537,37 @@ impl Ingestor {
 
     /// Extract a numeric memo id from the joined transaction (`memo_type == "id"`).
     fn memo_id(&self, rec: &PaymentRecord) -> Option<i64> {
-        let tx = rec.transaction.as_ref()?;
-        if tx.memo_type.as_deref() != Some("id") {
-            return None;
-        }
-        tx.memo.as_deref()?.parse::<i64>().ok()
+        memo_id_of_tx(rec.transaction.as_ref()?)
     }
+}
+
+/// A numeric memo id from a transaction (`memo_type == "id"`), if it fits in `i64`.
+fn memo_id_of_tx(tx: &horizon::TransactionRecord) -> Option<i64> {
+    if tx.memo_type.as_deref() != Some("id") {
+        return None;
+    }
+    tx.memo.as_deref()?.parse::<i64>().ok()
+}
+
+/// A validated credit to our account, ready to record as a deposit.
+struct Credit {
+    amount: String,
+    asset_type: Option<String>,
+    asset_code: Option<String>,
+    asset_issuer: Option<String>,
+    source_account: Option<String>,
+    destination_account: Option<String>,
+    /// Muxed id or memo id used to find the customer address; `None` quarantines the deposit.
+    customer_id: Option<i64>,
+    memo_id: Option<i64>,
+}
+
+/// Horizon operation type for claiming a claimable balance (issue #448).
+const CLAIM_KIND: &str = "claim_claimable_balance";
+
+/// A claimable balance id as Horizon renders it: hex, 72 chars for the v0 id type.
+fn is_balance_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 80 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Operation types that deliver funds to their destination account.
@@ -1043,6 +1136,8 @@ mod tests {
             asset_issuer: None,
             amount: Some("5.0000000".into()),
             starting_balance: None,
+            balance_id: None,
+            claimant: None,
             transaction: None,
         }
     }
@@ -1185,6 +1280,15 @@ mod tests {
             assert!(is_credit_kind(&r.kind), "{kind}");
             assert_eq!(credited_amount(&r), Some("9.5000000"), "{kind}");
             assert_eq!(r.asset_code.as_deref(), Some("USDC"), "{kind}");
+        }
+    }
+
+    #[test]
+    fn balance_ids_must_be_bounded_hex() {
+        let real = "00000000929b20b72e5890ab51c24f1cc46fa01c4f318d8d33367d24dd614cfdf5491072";
+        assert!(is_balance_id(real));
+        for bad in ["", "../../accounts/G", "00ff?cursor=1", &"a".repeat(81)] {
+            assert!(!is_balance_id(bad), "{bad:?}");
         }
     }
 
