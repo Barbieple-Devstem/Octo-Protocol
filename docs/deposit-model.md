@@ -83,3 +83,13 @@ Rules:
 To see claims at all, ingest reads `/accounts/{G}/operations` rather than `/payments` (claims are
 not payments in Horizon's view). Paging tokens are the same operation TOIDs on both endpoints, so
 cursors carry over unchanged.
+
+## Failed transactions
+
+An operation whose transaction failed on-chain moved no funds and **never** creates a deposit, for
+every operation type above. This is enforced at a single point (`is_from_successful_tx`, the first
+check in `Ingestor::process`, which returns `Processed::FailedTransaction`), not by relying on
+Horizon hiding failed transactions. It fails closed: a record without `transaction_successful` is
+treated as failed. The cursor still advances past such operations so they are not re-fetched.
+Regression tests: `invariant_failed_transactions_never_create_deposits` and
+`invariant_failed_payment_from_horizon_creates_no_deposit_row`.

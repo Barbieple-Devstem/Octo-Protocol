@@ -6,7 +6,7 @@
 //! `address_id` (quarantine) — they are never guessed onto a customer.
 //!
 //! Security (see `docs/threat-model.md`):
-//! - Only `transaction_successful` payments are credited (no failed/reorged double-credit).
+//! - Only `transaction_successful` operations are credited, enforced once in `is_from_successful_tx`.
 //! - Dedup on the Horizon operation id (TOID) → replays/re-deliveries are no-ops.
 //! - Amounts are integer stroops (no floats); only whitelisted incoming directions are credited.
 //! - The cursor is advanced and persisted only after a record is processed, so a crash resumes
@@ -83,6 +83,8 @@ pub enum Processed {
     Recorded { attributed: bool },
     /// Already recorded (idempotent no-op).
     Duplicate,
+    /// The operation's transaction failed on-chain, so it moved no funds (issue #449).
+    FailedTransaction,
     /// Skipped (not a credit to us, failed tx, unknown asset shape, etc.).
     Skipped,
 }
@@ -203,9 +205,10 @@ impl Ingestor {
 
     /// Process one operation record into a deposit (or skip it).
     pub async fn process(&self, rec: &PaymentRecord) -> Result<Processed, IngestError> {
-        // 1. Only successful credits to us.
-        if !rec.transaction_successful {
-            return Ok(Processed::Skipped);
+        // 1. The one place failed transactions are rejected; nothing below may run for them.
+        if !is_from_successful_tx(rec) {
+            tracing::debug!(op_id = %rec.id, kind = %rec.kind, "ignoring operation of failed transaction");
+            return Ok(Processed::FailedTransaction);
         }
 
         let ledger = rec.transaction.as_ref().and_then(|t| t.ledger);
@@ -568,6 +571,15 @@ const CLAIM_KIND: &str = "claim_claimable_balance";
 /// A claimable balance id as Horizon renders it: hex, 72 chars for the v0 id type.
 fn is_balance_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 80 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Invariant (issue #449): an operation from a failed transaction never credits a balance.
+///
+/// This is the single check `Ingestor::process` relies on — not Horizon's default of hiding
+/// failed transactions — and it fails closed: `transaction_successful` deserializes to `false`
+/// when Horizon omits it.
+fn is_from_successful_tx(rec: &PaymentRecord) -> bool {
+    rec.transaction_successful
 }
 
 /// Operation types that deliver funds to their destination account.
@@ -1281,6 +1293,21 @@ mod tests {
             assert_eq!(credited_amount(&r), Some("9.5000000"), "{kind}");
             assert_eq!(r.asset_code.as_deref(), Some("USDC"), "{kind}");
         }
+    }
+
+    // Invariant #449: a record that does not say its transaction succeeded is treated as failed.
+    #[test]
+    fn failed_transaction_invariant_fails_closed_when_flag_is_missing() {
+        let r: PaymentRecord = serde_json::from_value(serde_json::json!({
+            "id": "12884905985", "paging_token": "12884905985", "type": "payment",
+            "to": BASE, "amount": "1.0000000", "asset_type": "native",
+        }))
+        .unwrap();
+        assert!(!is_from_successful_tx(&r));
+        let mut ok = rec();
+        assert!(is_from_successful_tx(&ok));
+        ok.transaction_successful = false;
+        assert!(!is_from_successful_tx(&ok));
     }
 
     #[test]

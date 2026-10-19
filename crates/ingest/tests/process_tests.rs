@@ -193,7 +193,7 @@ async fn failed_tx_is_skipped() {
 
     let mut rec = base_record("op-failed-1");
     rec.transaction_successful = false;
-    assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Skipped);
+    assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::FailedTransaction);
     assert_eq!(
         store
             .list_transactions(wallet_id, 100, None)
@@ -605,4 +605,81 @@ async fn claim_by_another_account_is_skipped_without_calling_horizon() {
         .await
         .unwrap()
         .is_empty());
+}
+
+/// Every crediting operation type, each from a failed transaction, with a valid TOID.
+fn failed_fixtures() -> Vec<PaymentRecord> {
+    let mut payment = path_payment_record("path_payment_strict_send", None);
+    payment.kind = "payment".into();
+    let mut create = path_payment_record("path_payment_strict_send", None);
+    create.kind = "create_account".into();
+    create.starting_balance = Some("5.0000000".into());
+    let mut all = vec![
+        payment,
+        create,
+        path_payment_record("path_payment_strict_send", None),
+        path_payment_record("path_payment_strict_receive", None),
+        claim_record(&unique_balance_id()),
+    ];
+    for rec in &mut all {
+        rec.transaction_successful = false;
+    }
+    all
+}
+
+// Invariant #449: failed payments never create deposits, whatever the operation type.
+#[tokio::test]
+async fn invariant_failed_transactions_never_create_deposits() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+    // `ingestor` targets an unreachable Horizon: a failed claim must not even attempt a lookup.
+    for rec in failed_fixtures() {
+        assert_eq!(
+            ingestor.process(&rec).await.unwrap(),
+            Processed::FailedTransaction,
+            "{}",
+            rec.kind
+        );
+    }
+    assert!(store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+// Invariant #449 end to end: a failed payment served by Horizon is passed over, not credited.
+#[tokio::test]
+async fn invariant_failed_payment_from_horizon_creates_no_deposit_row() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let Some((store, _, wallet_id)) = setup().await else {
+        return;
+    };
+    let mut failed = path_payment_record("path_payment_strict_send", None);
+    failed.kind = "payment".into();
+    failed.transaction_successful = false;
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/accounts/{BASE}/operations")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "_embedded": { "records": [failed] }
+        })))
+        .mount(&server)
+        .await;
+    let ingestor = Ingestor::new(store.clone(), &server.uri(), wallet_id, BASE.to_string());
+
+    assert_eq!(ingestor.poll_once(10).await.unwrap(), 1);
+    assert!(store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .unwrap()
+        .is_empty());
+    // The cursor still moves past it, so a failed op is never re-fetched forever.
+    assert_eq!(
+        store.get_cursor(wallet_id).await.unwrap().as_deref(),
+        Some(failed.paging_token.as_str())
+    );
 }
