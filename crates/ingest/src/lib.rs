@@ -11,16 +11,22 @@
 //! - Amounts are integer stroops (no floats); only whitelisted incoming directions are credited.
 //! - The cursor is advanced and persisted only after a record is processed, so a crash resumes
 //!   without missing or double-processing.
+//!
+//! Wallets opted into streaming receive records over Horizon SSE instead (see [`stream`]), through
+//! the same `process` path and cursor; polling takes over whenever a stream is down.
 #![forbid(unsafe_code)]
 
 pub mod amount;
 pub mod horizon;
+pub mod stream;
 
 #[cfg(test)]
 mod backfill_tests;
 
 use horizon::{HorizonPayments, PaymentRecord};
 use octo_store::{IngestLeaderLock, NewDeposit, Store, Wallet};
+pub use stream::LiveStreams;
+use stream::StreamSet;
 use octo_wallet_core::decode_muxed;
 use octo_webhooks::{Event, WebhookSender};
 use std::collections::HashMap;
@@ -155,6 +161,12 @@ impl Ingestor {
             count += 1;
         }
 
+        self.record_poll_success();
+        Ok(count)
+    }
+
+    /// Stamp the lag tracker: Horizon answered for this wallet just now (poll or stream).
+    fn record_poll_success(&self) {
         if let Some(ref tracker) = self.tracker {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -162,8 +174,6 @@ impl Ingestor {
                 .unwrap_or(0);
             tracker.record_success(self.wallet_id, now);
         }
-
-        Ok(count)
     }
 
     /// Run forever, polling every `interval`. Errors are logged and retried (the cursor makes this
@@ -572,6 +582,8 @@ pub struct Supervisor {
     circuit: octo_resilience::CircuitBreaker,
     /// How often a standby instance retries the ingest leader lock.
     lock_retry: Duration,
+    /// Wallets currently served by an open SSE stream; `tick` leaves them to the stream.
+    live: LiveStreams,
 }
 
 /// One wallet's progress through a single tick, handed from one page poll to the next.
@@ -623,6 +635,7 @@ impl Supervisor {
             retry,
             circuit,
             lock_retry: Self::DEFAULT_LOCK_RETRY,
+            live: LiveStreams::default(),
         }
     }
 
@@ -723,12 +736,15 @@ impl Supervisor {
         page_limit: u32,
         shutdown: &CancellationToken,
     ) {
+        // Streams live only as long as this leadership term, so a standby never streams too.
+        let mut streams = StreamSet::new(self.live.clone(), shutdown);
         while !shutdown.is_cancelled() {
             // A leader whose lock session died must stop before a standby starts, not after.
             if !lock.still_held().await {
                 tracing::warn!(network = self.network, "lost ingest leader lock; standing by");
-                return;
+                break;
             }
+            self.sync_streams(&mut streams).await;
             if let Err(e) = self.tick(page_limit).await {
                 tracing::warn!(error = ?e, "ingest supervisor tick failed; will retry");
             }
@@ -737,6 +753,20 @@ impl Supervisor {
                 () = tokio::time::sleep(interval) => {}
                 () = shutdown.cancelled() => {}
             }
+        }
+        streams.stop().await;
+    }
+
+    /// Reconcile running streams with the wallets currently opted into streaming.
+    async fn sync_streams(&self, streams: &mut StreamSet) {
+        match self
+            .store
+            .streaming_wallets(self.network, Self::MAX_STREAMS)
+            .await
+        {
+            Ok(wanted) => streams.sync(&wanted, |w| self.ingestor_for(w)),
+            // Keep existing streams on a lookup failure; polling still covers everyone else.
+            Err(e) => tracing::warn!(error = ?e, "failed to load streaming wallets"),
         }
     }
 
@@ -786,6 +816,10 @@ impl Supervisor {
             after_id = page.last().map(|w| w.id);
 
             for w in &page {
+                // An open stream already delivers this wallet's payments; polling is its fallback.
+                if self.live.contains(w.id) {
+                    continue;
+                }
                 let turn = WalletTurn {
                     ingestor: self.ingestor_for(w),
                     pages: 0,
@@ -902,6 +936,9 @@ impl Supervisor {
     /// Wallets fetched per page during the fan-out. Bounds both the query size and the number of
     /// queued poll tasks (roughly two pages at most) regardless of total wallet count.
     const FANOUT_PAGE_SIZE: i64 = 500;
+
+    /// Upper bound on concurrently open SSE streams per network; each holds one connection.
+    const MAX_STREAMS: i64 = 200;
 
     /// How many wallets to poll concurrently in one [`Supervisor::tick`] pass.
     const MAX_CONCURRENT_POLLS: usize = 20;

@@ -1,9 +1,11 @@
 //! Horizon payments client for the ingest worker.
 //!
 //! Polls an account's `/payments` endpoint (with `join=transactions` so we get the memo) using a
-//! saved paging-token cursor. Cursor polling — rather than the SSE stream — keeps the worker
-//! simple, restart-safe, and trivially horizontally scalable (one worker per account); the cursor
-//! is the durable resume point.
+//! saved paging-token cursor. Cursor polling keeps the worker simple, restart-safe, and trivially
+//! horizontally scalable (one worker per account); the cursor is the durable resume point.
+//!
+//! Wallets opted into streaming (issue #446) additionally hold an SSE connection via
+//! [`HorizonPayments::open_payment_stream`], resumed from the same cursor; polling is the fallback.
 //!
 //! # Resilience
 //!
@@ -206,6 +208,139 @@ impl HorizonPayments {
             Err(ResilienceError::Exhausted(_)) => Err(HorizonError::Request),
         }
     }
+
+    /// Open Horizon's `/payments` SSE stream for `account_g`, resuming after `cursor`.
+    ///
+    /// Gated by the same circuit breaker as [`Self::payments_after`], so an outage stops both
+    /// paths. There is no internal retry: the caller owns reconnect backoff (see `stream.rs`).
+    #[tracing::instrument(name = "horizon_open_payment_stream", skip(self), fields(account_g = %account_g))]
+    pub async fn open_payment_stream(
+        &self,
+        account_g: &str,
+        cursor: &str,
+    ) -> Result<PaymentStream, HorizonError> {
+        self.circuit.check().map_err(|_| HorizonError::CircuitOpen)?;
+        let url = format!(
+            "{}/accounts/{}/payments",
+            self.base_url.trim_end_matches('/'),
+            account_g
+        );
+        // Headers arrive immediately on a live stream; a hung connect must not pin the task.
+        let sent = tokio::time::timeout(
+            STREAM_CONNECT_TIMEOUT,
+            self.http
+                .get(&url)
+                .query(&[("cursor", cursor), ("join", "transactions")])
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .send(),
+        )
+        .await;
+        let resp = match sent {
+            Ok(Ok(resp)) => resp,
+            _ => {
+                self.circuit.on_failure();
+                return Err(HorizonError::Request);
+            }
+        };
+        if resp.status().is_server_error() {
+            self.circuit.on_failure();
+            return Err(HorizonError::Request);
+        }
+        // Any non-5xx answer proves Horizon is reachable, so it closes a half-open breaker.
+        self.circuit.on_success();
+        if !resp.status().is_success() {
+            return Err(HorizonError::Request);
+        }
+        Ok(PaymentStream {
+            resp,
+            decoder: SseDecoder::default(),
+        })
+    }
+}
+
+/// How long opening a stream may take before it counts as a failed connect.
+const STREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Upper bound on one buffered SSE line or event, so a hostile upstream cannot exhaust memory.
+const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+
+/// An open Horizon `/payments` SSE stream (issue #446).
+pub struct PaymentStream {
+    resp: reqwest::Response,
+    decoder: SseDecoder,
+}
+
+impl PaymentStream {
+    /// The next payment record, or `Ok(None)` once Horizon closes the stream.
+    pub async fn next_record(&mut self) -> Result<Option<PaymentRecord>, HorizonError> {
+        loop {
+            if let Some(rec) = self.decoder.next_record()? {
+                return Ok(Some(rec));
+            }
+            match self.resp.chunk().await {
+                Ok(Some(bytes)) => self.decoder.feed(&bytes)?,
+                Ok(None) => return Ok(None),
+                Err(_) => return Err(HorizonError::Request),
+            }
+        }
+    }
+}
+
+/// Incremental `text/event-stream` decoder that yields Horizon payment records.
+#[derive(Debug, Default)]
+pub struct SseDecoder {
+    buf: Vec<u8>,
+    data: String,
+}
+
+impl SseDecoder {
+    /// Append raw bytes from the wire.
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<(), HorizonError> {
+        self.buf.extend_from_slice(bytes);
+        // A line this long without a newline is never a legitimate Horizon event.
+        if self.buf.len() > MAX_SSE_EVENT_BYTES && !self.buf.contains(&b'\n') {
+            return Err(HorizonError::Decode);
+        }
+        Ok(())
+    }
+
+    /// The next complete payment record already buffered, if any.
+    ///
+    /// Horizon's `"hello"`/`"byebye"` string events are ignored; an object that is not a valid
+    /// record is an error, so the caller reconnects and the record is never silently skipped.
+    pub fn next_record(&mut self) -> Result<Option<PaymentRecord>, HorizonError> {
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let raw: Vec<u8> = self.buf.drain(..=pos).collect();
+            let line = std::str::from_utf8(&raw).map_err(|_| HorizonError::Decode)?;
+            let line = line.trim_end_matches(['\n', '\r']);
+            if line.is_empty() {
+                let data = std::mem::take(&mut self.data);
+                if let Some(rec) = parse_sse_data(&data)? {
+                    return Ok(Some(rec));
+                }
+            } else if let Some(value) = line.strip_prefix("data:") {
+                if !self.data.is_empty() {
+                    self.data.push('\n');
+                }
+                self.data.push_str(value.strip_prefix(' ').unwrap_or(value));
+                if self.data.len() > MAX_SSE_EVENT_BYTES {
+                    return Err(HorizonError::Decode);
+                }
+            }
+            // `event:`, `id:`, `retry:` and `:` comment lines carry nothing octo needs.
+        }
+        Ok(None)
+    }
+}
+
+/// Decode one SSE event payload: a JSON object is a record, anything else is a control event.
+fn parse_sse_data(data: &str) -> Result<Option<PaymentRecord>, HorizonError> {
+    if !data.trim_start().starts_with('{') {
+        return Ok(None);
+    }
+    serde_json::from_str(data)
+        .map(Some)
+        .map_err(|_| HorizonError::Decode)
 }
 
 // ---------------------------------------------------------------------------
@@ -270,5 +405,44 @@ mod tests {
 
         let spans = recorded_spans.lock().unwrap().clone();
         assert!(spans.contains(&"horizon_payments_after".to_string()));
+    }
+
+    fn sse_record(id: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","paging_token":"{id}","type":"payment","transaction_successful":true,"to":"GBASE","amount":"1.0000000","asset_type":"native"}}"#
+        )
+    }
+
+    // A record split across chunks is reassembled; Horizon's string control events are ignored.
+    #[test]
+    fn sse_decoder_yields_records_across_chunk_boundaries() {
+        let wire = format!(
+            "retry: 1000\nevent: open\ndata: \"hello\"\n\nid: 1\ndata: {}\n\n: keepalive\n",
+            sse_record("12884905985")
+        );
+        let (a, b) = wire.split_at(wire.len() / 2);
+        let mut decoder = SseDecoder::default();
+        decoder.feed(a.as_bytes()).unwrap();
+        assert!(decoder.next_record().unwrap().is_none());
+        decoder.feed(b.as_bytes()).unwrap();
+        let rec = decoder.next_record().unwrap().expect("record");
+        assert_eq!(rec.id, "12884905985");
+        assert!(decoder.next_record().unwrap().is_none());
+    }
+
+    // A malformed record must end the session rather than be skipped past the cursor.
+    #[test]
+    fn sse_decoder_rejects_malformed_record_objects() {
+        let mut decoder = SseDecoder::default();
+        decoder.feed(b"data: {\"id\": 5}\n\n").unwrap();
+        assert!(matches!(decoder.next_record(), Err(HorizonError::Decode)));
+    }
+
+    // An endless line with no newline is refused instead of buffered without bound.
+    #[test]
+    fn sse_decoder_bounds_unterminated_lines() {
+        let mut decoder = SseDecoder::default();
+        let junk = vec![b'a'; MAX_SSE_EVENT_BYTES + 1];
+        assert!(matches!(decoder.feed(&junk), Err(HorizonError::Decode)));
     }
 }
