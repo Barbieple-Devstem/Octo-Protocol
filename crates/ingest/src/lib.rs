@@ -207,7 +207,7 @@ impl Ingestor {
         if !rec.transaction_successful {
             return Ok(Processed::Skipped);
         }
-        if rec.kind != "payment" && rec.kind != "create_account" {
+        if !is_credit_kind(&rec.kind) {
             return Ok(Processed::Skipped);
         }
         // The destination base account must be our master account.
@@ -215,13 +215,13 @@ impl Ingestor {
             Some(to) if to == self.account_g => {}
             _ => return Ok(Processed::Skipped),
         }
+        // A path payment from ourselves to ourselves is an asset conversion, not new funds.
+        if is_path_payment(&rec.kind) && rec.from.as_deref() == Some(self.account_g.as_str()) {
+            return Ok(Processed::Skipped);
+        }
 
-        // 2. Amount → stroops (payment uses `amount`, create_account uses `starting_balance`).
-        let amount_str = rec
-            .amount
-            .as_deref()
-            .or(rec.starting_balance.as_deref())
-            .unwrap_or("");
+        // 2. Amount → stroops, from the field that holds what the destination actually received.
+        let amount_str = credited_amount(rec).unwrap_or("");
         let Some(stroops) = amount::to_stroops(amount_str) else {
             // Never credit an approximation: surface the unparseable amount (no customer data).
             tracing::warn!(
@@ -474,6 +474,28 @@ impl Ingestor {
             return None;
         }
         tx.memo.as_deref()?.parse::<i64>().ok()
+    }
+}
+
+/// Operation types that deliver funds to their destination account.
+fn is_credit_kind(kind: &str) -> bool {
+    kind == "payment" || kind == "create_account" || is_path_payment(kind)
+}
+
+/// Path payments (issue #447): both variants deliver the destination asset to `to`.
+fn is_path_payment(kind: &str) -> bool {
+    kind == "path_payment_strict_send" || kind == "path_payment_strict_receive"
+}
+
+/// The amount a record credits to its destination.
+///
+/// For path payments Horizon's `amount`/`asset_*` describe what the destination received;
+/// `source_amount`/`source_asset_*` are what the sender spent and are deliberately never read.
+/// `create_account` carries its credit in `starting_balance`.
+fn credited_amount(rec: &PaymentRecord) -> Option<&str> {
+    match rec.kind.as_str() {
+        "create_account" => rec.starting_balance.as_deref(),
+        _ => rec.amount.as_deref(),
     }
 }
 
@@ -1133,6 +1155,44 @@ mod tests {
             None,
             "memo string one above i64::MAX must be silently unattributed (current documented behavior)"
         );
+    }
+
+    /// A Horizon-shaped `path_payment_strict_send` whose source side differs from what landed.
+    fn path_payment_fixture(kind: &str) -> PaymentRecord {
+        serde_json::from_value(serde_json::json!({
+            "id": "12884905985",
+            "paging_token": "12884905985",
+            "type": kind,
+            "transaction_successful": true,
+            "transaction_hash": "pathhash",
+            "from": "GSENDER",
+            "to": BASE,
+            "asset_type": "credit_alphanum4",
+            "asset_code": "USDC",
+            "asset_issuer": "GISSUER",
+            "amount": "9.5000000",
+            "source_asset_type": "native",
+            "source_amount": "100.0000000",
+        }))
+        .expect("fixture deserializes")
+    }
+
+    // Both path-payment variants credit the destination amount, never the source amount.
+    #[test]
+    fn path_payments_credit_the_destination_amount() {
+        for kind in ["path_payment_strict_send", "path_payment_strict_receive"] {
+            let r = path_payment_fixture(kind);
+            assert!(is_credit_kind(&r.kind), "{kind}");
+            assert_eq!(credited_amount(&r), Some("9.5000000"), "{kind}");
+            assert_eq!(r.asset_code.as_deref(), Some("USDC"), "{kind}");
+        }
+    }
+
+    #[test]
+    fn non_crediting_operation_types_are_not_credit_kinds() {
+        for kind in ["account_merge", "manage_sell_offer", "change_trust", "path_payment"] {
+            assert!(!is_credit_kind(kind), "{kind}");
+        }
     }
 
     #[test]

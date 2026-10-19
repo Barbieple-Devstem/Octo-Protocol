@@ -390,3 +390,92 @@ async fn exact_payment_link_deposit_confirms() {
         .unwrap();
     assert_eq!(payment.status, "confirmed");
 }
+
+/// A fresh, decodable Horizon TOID (random ledger and tx order, first operation) and its ledger.
+fn unique_toid() -> (String, i64) {
+    let r = Uuid::new_v4().as_u128();
+    let ledger = 1 + (r % 50_000_000) as u64;
+    let tx_order = 1 + ((r >> 64) % 1_000) as u64;
+    (((ledger << 32) | (tx_order << 12) | 1).to_string(), ledger as i64)
+}
+
+/// A Horizon-shaped path payment that spent 100 XLM and delivered 9.5 USDC to `to_muxed`.
+fn path_payment_record(kind: &str, to_muxed: Option<String>) -> PaymentRecord {
+    let (toid, ledger) = unique_toid();
+    serde_json::from_value(serde_json::json!({
+        "id": toid,
+        "paging_token": toid,
+        "type": kind,
+        "transaction_successful": true,
+        "transaction_hash": format!("pathhash-{}", Uuid::new_v4().simple()),
+        "from": "GPATHSENDER",
+        "to": BASE,
+        "to_muxed": to_muxed,
+        "asset_type": "credit_alphanum4",
+        "asset_code": "USDC",
+        "asset_issuer": USDC_TESTNET_ISSUER,
+        "amount": "9.5000000",
+        "source_asset_type": "native",
+        "source_amount": "100.0000000",
+        "transaction": { "ledger": ledger },
+    }))
+    .expect("path payment fixture")
+}
+
+#[tokio::test]
+async fn path_payment_deposits_are_recorded_once_with_the_received_amount() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+
+    for kind in ["path_payment_strict_send", "path_payment_strict_receive"] {
+        let addr = store
+            .allocate_address(
+                wallet_id,
+                |id| encode_muxed(BASE, id as u64).map_err(|_| ()),
+                Some(kind),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        let rec = path_payment_record(kind, Some(addr.muxed_address.clone()));
+
+        assert_eq!(
+            ingestor.process(&rec).await.unwrap(),
+            Processed::Recorded { attributed: true },
+            "{kind}"
+        );
+        // Dedup by operation id still holds for path payments.
+        assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Duplicate, "{kind}");
+
+        let txs = store.list_transactions(wallet_id, 100, None).await.unwrap();
+        let row = txs
+            .iter()
+            .find(|t| t.address_id == Some(addr.id))
+            .expect("deposit row");
+        assert_eq!(row.amount_stroops, 95_000_000, "{kind}: destination amount, not source");
+        assert_eq!(row.asset_code, "USDC", "{kind}: destination asset, not source");
+        assert_eq!(
+            txs.iter().filter(|t| t.address_id == Some(addr.id)).count(),
+            1,
+            "{kind}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn self_path_payment_conversion_is_not_a_deposit() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+
+    // The master account converting its own XLM into USDC must not look like incoming funds.
+    let mut rec = path_payment_record("path_payment_strict_send", None);
+    rec.from = Some(BASE.into());
+    assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Skipped);
+    assert!(store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .unwrap()
+        .is_empty());
+}
