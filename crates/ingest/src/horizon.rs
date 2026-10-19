@@ -314,7 +314,7 @@ impl HorizonPayments {
     ///
     /// Gated by the same circuit breaker as [`Self::payments_after`], so an outage stops both
     /// paths. There is no internal retry: the caller owns reconnect backoff (see `stream.rs`).
-    #[tracing::instrument(name = "horizon_open_payment_stream", skip(self), fields(account_g = %account_g))]
+    #[tracing::instrument(name = "horizon_open_payment_stream", skip(self))]
     pub async fn open_payment_stream(
         &self,
         account_g: &str,
